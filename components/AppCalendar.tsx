@@ -1,12 +1,14 @@
 'use client';
 
-import { useState, useMemo, useEffect, useCallback } from 'react';
+import { useState, useMemo, useEffect, useCallback, useRef } from 'react';
 import {
   format,
   startOfMonth, endOfMonth,
   startOfWeek,  endOfWeek,
+  startOfDay,   endOfDay,
   addDays, addMonths, subMonths,
   isSameMonth, isSameDay, isToday,
+  getHours, getMinutes, differenceInMinutes,
 } from 'date-fns';
 import { useSession, signIn } from 'next-auth/react';
 import { SerializableEvent } from '@/lib/types';
@@ -23,31 +25,77 @@ function colorFor(index: number) {
   return EVENT_COLORS[index % EVENT_COLORS.length];
 }
 
+type ViewMode = 'month' | 'week' | 'day';
+
+const HOUR_HEIGHT = 48; // px per hour in the time-grid views
+const HOURS = Array.from({ length: 24 }, (_, i) => i);
+
+// Persisted across route changes (calendar <-> chat) via sessionStorage.
+const VIEW_KEY = 'calendar:view';
+const DATE_KEY = 'calendar:date';
+
+function loadInitialView(): ViewMode {
+  if (typeof window === 'undefined') return 'month';
+  const saved = window.sessionStorage.getItem(VIEW_KEY);
+  return saved === 'month' || saved === 'week' || saved === 'day' ? saved : 'month';
+}
+
+function loadInitialDate(): Date {
+  if (typeof window === 'undefined') return new Date();
+  const saved = window.sessionStorage.getItem(DATE_KEY);
+  if (!saved) return new Date();
+  const d = new Date(saved);
+  return Number.isNaN(d.getTime()) ? new Date() : d;
+}
+
+function formatHour(h: number) {
+  if (h === 0) return '12 AM';
+  if (h === 12) return '12 PM';
+  return h < 12 ? `${h} AM` : `${h - 12} PM`;
+}
+
 export default function AppCalendar() {
   const { data: session, status } = useSession();
-  const [currentDate, setCurrentDate] = useState(new Date());
+  const [view, setView] = useState<ViewMode>(loadInitialView);
+  const [currentDate, setCurrentDate] = useState<Date>(loadInitialDate);
   const [events, setEvents] = useState<SerializableEvent[]>([]);
   const [loading, setLoading] = useState(false);
   const [selectedEvent, setSelectedEvent] = useState<SerializableEvent | null>(null);
   const [deleting, setDeleting] = useState(false);
 
-  const calendarDays = useMemo(() => {
-    const monthStart = startOfMonth(currentDate);
-    const monthEnd   = endOfMonth(currentDate);
-    const gridStart  = startOfWeek(monthStart);
-    const gridEnd    = endOfWeek(monthEnd);
+  // The date range currently on screen — drives both fetching and the header.
+  const { rangeStart, rangeEnd } = useMemo(() => {
+    if (view === 'month') {
+      return {
+        rangeStart: startOfWeek(startOfMonth(currentDate)),
+        rangeEnd:   endOfWeek(endOfMonth(currentDate)),
+      };
+    }
+    if (view === 'week') {
+      return { rangeStart: startOfWeek(currentDate), rangeEnd: endOfWeek(currentDate) };
+    }
+    return { rangeStart: startOfDay(currentDate), rangeEnd: endOfDay(currentDate) };
+  }, [view, currentDate]);
+
+  const monthGridDays = useMemo(() => {
     const days: Date[] = [];
-    let day = gridStart;
+    let day = startOfWeek(startOfMonth(currentDate));
+    const gridEnd = endOfWeek(endOfMonth(currentDate));
     while (day <= gridEnd) { days.push(day); day = addDays(day, 1); }
     return days;
+  }, [currentDate]);
+
+  const weekDays = useMemo(() => {
+    const start = startOfWeek(currentDate);
+    return Array.from({ length: 7 }, (_, i) => addDays(start, i));
   }, [currentDate]);
 
   const fetchEvents = useCallback(async () => {
     if (!session?.accessToken) return;
     setLoading(true);
     try {
-      const start = format(startOfWeek(startOfMonth(currentDate)), 'yyyy-MM-dd');
-      const end   = format(endOfWeek(endOfMonth(currentDate)),     'yyyy-MM-dd');
+      const start = format(rangeStart, 'yyyy-MM-dd');
+      const end   = format(rangeEnd,   'yyyy-MM-dd');
       const res = await fetch(`/api/google-calendar?startDate=${start}&endDate=${end}`);
       if (res.ok) {
         const data = await res.json();
@@ -56,12 +104,28 @@ export default function AppCalendar() {
     } finally {
       setLoading(false);
     }
-  }, [session, currentDate]);
+  }, [session, rangeStart, rangeEnd]);
 
   useEffect(() => { fetchEvents(); }, [fetchEvents]);
 
+  // Remember the viewing state so it survives navigating away and back.
+  useEffect(() => { window.sessionStorage.setItem(VIEW_KEY, view); }, [view]);
+  useEffect(() => { window.sessionStorage.setItem(DATE_KEY, currentDate.toISOString()); }, [currentDate]);
+
   const getEventsForDay = (day: Date) =>
-    events.filter(e => isSameDay(new Date(e.start), day));
+    events
+      .filter(e => isSameDay(new Date(e.start), day))
+      .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
+
+  const navigate = (dir: 1 | -1) => {
+    setCurrentDate(d => {
+      if (view === 'month') return dir === 1 ? addMonths(d, 1) : subMonths(d, 1);
+      if (view === 'week')  return addDays(d, dir * 7);
+      return addDays(d, dir);
+    });
+  };
+
+  const goToToday = () => setCurrentDate(new Date());
 
   const deleteEvent = async (eventId: string) => {
     setDeleting(true);
@@ -79,6 +143,19 @@ export default function AppCalendar() {
       setDeleting(false);
     }
   };
+
+  const title = useMemo(() => {
+    if (view === 'month') return format(currentDate, 'MMMM yyyy');
+    if (view === 'week') {
+      const start = startOfWeek(currentDate);
+      const end   = endOfWeek(currentDate);
+      const sameMonth = isSameMonth(start, end);
+      return sameMonth
+        ? `${format(start, 'MMM d')} – ${format(end, 'd, yyyy')}`
+        : `${format(start, 'MMM d')} – ${format(end, 'MMM d, yyyy')}`;
+    }
+    return format(currentDate, 'EEEE, MMMM d, yyyy');
+  }, [view, currentDate]);
 
   if (status === 'loading') {
     return (
@@ -114,19 +191,35 @@ export default function AppCalendar() {
 
   return (
     <div className="h-full flex flex-col bg-white">
-      {/* Month nav */}
-      <div className="flex items-center justify-between px-6 py-4 border-b">
-        <button
-          onClick={() => setCurrentDate(subMonths(currentDate, 1))}
-          className="p-2 rounded-lg hover:bg-gray-100 text-gray-600 transition-colors text-lg font-medium"
-          aria-label="Previous month"
-        >‹</button>
-        <div className="text-center">
-          <h2 className="text-xl font-bold text-gray-900">{format(currentDate, 'MMMM yyyy')}</h2>
-          <p className="text-xs text-gray-400 mt-0.5">
-            {loading ? 'Loading…' : `${events.length} event${events.length !== 1 ? 's' : ''}`}
-          </p>
+      {/* Toolbar */}
+      <div className="flex items-center justify-between px-6 py-4 border-b gap-4">
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => navigate(-1)}
+              className="p-2 rounded-lg hover:bg-gray-100 text-gray-600 transition-colors text-lg font-medium leading-none"
+              aria-label="Previous"
+            >‹</button>
+            <button
+              onClick={() => navigate(1)}
+              className="p-2 rounded-lg hover:bg-gray-100 text-gray-600 transition-colors text-lg font-medium leading-none"
+              aria-label="Next"
+            >›</button>
+          </div>
+          <button
+            onClick={goToToday}
+            className="px-3 py-1.5 rounded-lg border border-gray-200 hover:bg-gray-50 text-xs font-medium text-gray-600 transition-colors"
+          >
+            Today
+          </button>
+          <div className="min-w-0">
+            <h2 className="text-lg font-bold text-gray-900 truncate">{title}</h2>
+            <p className="text-xs text-gray-400 mt-0.5">
+              {loading ? 'Loading…' : `${events.length} event${events.length !== 1 ? 's' : ''}`}
+            </p>
+          </div>
         </div>
+
         <div className="flex items-center gap-2">
           <button
             onClick={fetchEvents}
@@ -134,60 +227,45 @@ export default function AppCalendar() {
             className="p-2 rounded-lg hover:bg-gray-100 text-gray-400 hover:text-gray-600 transition-colors text-sm disabled:opacity-40"
             title="Refresh"
           >↻</button>
-          <button
-            onClick={() => setCurrentDate(addMonths(currentDate, 1))}
-            className="p-2 rounded-lg hover:bg-gray-100 text-gray-600 transition-colors text-lg font-medium"
-            aria-label="Next month"
-          >›</button>
+          {/* View switcher */}
+          <div className="flex items-center bg-gray-100 rounded-lg p-0.5">
+            {(['month', 'week', 'day'] as ViewMode[]).map(v => (
+              <button
+                key={v}
+                onClick={() => setView(v)}
+                className={`px-3 py-1.5 rounded-md text-xs font-medium capitalize transition-colors ${
+                  view === v ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+                }`}
+              >
+                {v}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
-      {/* Day-of-week headers */}
-      <div className="grid grid-cols-7 border-b">
-        {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(d => (
-          <div key={d} className="text-center text-xs font-semibold text-gray-400 uppercase tracking-wider py-2">
-            {d}
-          </div>
-        ))}
-      </div>
-
-      {/* Calendar grid */}
-      <div className="flex-1 grid grid-cols-7 auto-rows-fr divide-x divide-y divide-gray-100 overflow-hidden">
-        {calendarDays.map((day, idx) => {
-          const dayEvents = getEventsForDay(day);
-          const inMonth   = isSameMonth(day, currentDate);
-          const todayFlag = isToday(day);
-
-          return (
-            <div
-              key={idx}
-              className={`min-h-0 p-1 overflow-hidden flex flex-col ${!inMonth ? 'bg-gray-50' : 'bg-white'}`}
-            >
-              <div
-                className={`self-start w-7 h-7 flex items-center justify-center rounded-full text-sm font-medium mb-1 ${
-                  todayFlag ? 'bg-indigo-600 text-white' : inMonth ? 'text-gray-700' : 'text-gray-300'
-                }`}
-              >
-                {format(day, 'd')}
-              </div>
-              <div className="flex flex-col gap-0.5 overflow-hidden">
-                {dayEvents.slice(0, 3).map((event, i) => (
-                  <button
-                    key={event.id}
-                    onClick={() => setSelectedEvent(event)}
-                    className={`w-full text-left text-[11px] font-medium rounded px-1.5 py-0.5 truncate transition-colors ${colorFor(i)}`}
-                  >
-                    {event.title}
-                  </button>
-                ))}
-                {dayEvents.length > 3 && (
-                  <p className="text-[10px] text-gray-400 pl-1">+{dayEvents.length - 3} more</p>
-                )}
-              </div>
-            </div>
-          );
-        })}
-      </div>
+      {view === 'month' && (
+        <MonthView
+          days={monthGridDays}
+          currentDate={currentDate}
+          getEventsForDay={getEventsForDay}
+          onSelectEvent={setSelectedEvent}
+        />
+      )}
+      {view === 'week' && (
+        <TimeGridView
+          days={weekDays}
+          getEventsForDay={getEventsForDay}
+          onSelectEvent={setSelectedEvent}
+        />
+      )}
+      {view === 'day' && (
+        <TimeGridView
+          days={[currentDate]}
+          getEventsForDay={getEventsForDay}
+          onSelectEvent={setSelectedEvent}
+        />
+      )}
 
       {/* Event detail modal */}
       {selectedEvent && (
@@ -226,6 +304,160 @@ export default function AppCalendar() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/* ------------------------------- Month view ------------------------------- */
+
+interface ViewProps {
+  getEventsForDay: (day: Date) => SerializableEvent[];
+  onSelectEvent: (event: SerializableEvent) => void;
+}
+
+function MonthView({
+  days, currentDate, getEventsForDay, onSelectEvent,
+}: ViewProps & { days: Date[]; currentDate: Date }) {
+  return (
+    <div className="flex-1 flex flex-col overflow-hidden">
+      {/* Day-of-week headers */}
+      <div className="grid grid-cols-7 border-b">
+        {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(d => (
+          <div key={d} className="text-center text-xs font-semibold text-gray-400 uppercase tracking-wider py-2">
+            {d}
+          </div>
+        ))}
+      </div>
+
+      <div className="flex-1 grid grid-cols-7 auto-rows-fr divide-x divide-y divide-gray-100 overflow-hidden">
+        {days.map((day, idx) => {
+          const dayEvents = getEventsForDay(day);
+          const inMonth   = isSameMonth(day, currentDate);
+          const todayFlag = isToday(day);
+
+          return (
+            <div
+              key={idx}
+              className={`min-h-0 p-1 overflow-hidden flex flex-col ${!inMonth ? 'bg-gray-50' : 'bg-white'}`}
+            >
+              <div
+                className={`self-start w-7 h-7 flex items-center justify-center rounded-full text-sm font-medium mb-1 ${
+                  todayFlag ? 'bg-indigo-600 text-white' : inMonth ? 'text-gray-700' : 'text-gray-300'
+                }`}
+              >
+                {format(day, 'd')}
+              </div>
+              <div className="flex flex-col gap-0.5 overflow-hidden">
+                {dayEvents.slice(0, 3).map((event, i) => (
+                  <button
+                    key={event.id}
+                    onClick={() => onSelectEvent(event)}
+                    className={`w-full text-left text-[11px] font-medium rounded px-1.5 py-0.5 truncate transition-colors ${colorFor(i)}`}
+                  >
+                    {event.title}
+                  </button>
+                ))}
+                {dayEvents.length > 3 && (
+                  <p className="text-[10px] text-gray-400 pl-1">+{dayEvents.length - 3} more</p>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* --------------------------- Week / Day time grid -------------------------- */
+
+function TimeGridView({
+  days, getEventsForDay, onSelectEvent,
+}: ViewProps & { days: Date[] }) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Scroll to ~7 AM on first render so the day starts near business hours.
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = 7 * HOUR_HEIGHT;
+  }, []);
+
+  return (
+    <div className="flex-1 flex flex-col overflow-hidden">
+      {/* Column headers */}
+      <div className="flex border-b flex-shrink-0 pr-4">
+        <div className="w-14 flex-shrink-0" />
+        <div className="flex-1 grid" style={{ gridTemplateColumns: `repeat(${days.length}, minmax(0, 1fr))` }}>
+          {days.map((day, i) => {
+            const todayFlag = isToday(day);
+            return (
+              <div key={i} className="text-center py-2 border-l border-gray-100 first:border-l-0">
+                <div className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider">
+                  {format(day, 'EEE')}
+                </div>
+                <div
+                  className={`mt-1 mx-auto w-8 h-8 flex items-center justify-center rounded-full text-sm font-semibold ${
+                    todayFlag ? 'bg-indigo-600 text-white' : 'text-gray-700'
+                  }`}
+                >
+                  {format(day, 'd')}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Scrollable time grid */}
+      <div ref={scrollRef} className="flex-1 overflow-y-auto">
+        <div className="flex" style={{ height: 24 * HOUR_HEIGHT }}>
+          {/* Hour gutter */}
+          <div className="w-14 flex-shrink-0 relative">
+            {HOURS.map(h => (
+              <div key={h} className="absolute right-2 -translate-y-1/2 text-[10px] text-gray-400" style={{ top: h * HOUR_HEIGHT }}>
+                {h === 0 ? '' : formatHour(h)}
+              </div>
+            ))}
+          </div>
+
+          {/* Day columns */}
+          <div className="flex-1 grid" style={{ gridTemplateColumns: `repeat(${days.length}, minmax(0, 1fr))` }}>
+            {days.map((day, dayIdx) => {
+              const dayEvents = getEventsForDay(day);
+              return (
+                <div key={dayIdx} className="relative border-l border-gray-100 first:border-l-0">
+                  {/* Hour lines */}
+                  {HOURS.map(h => (
+                    <div
+                      key={h}
+                      className="absolute left-0 right-0 border-t border-gray-100"
+                      style={{ top: h * HOUR_HEIGHT }}
+                    />
+                  ))}
+
+                  {/* Events */}
+                  {dayEvents.map((event, i) => {
+                    const start = new Date(event.start);
+                    const end   = new Date(event.end);
+                    const top    = (getHours(start) + getMinutes(start) / 60) * HOUR_HEIGHT;
+                    const height = Math.max((differenceInMinutes(end, start) / 60) * HOUR_HEIGHT, 20);
+                    return (
+                      <button
+                        key={event.id}
+                        onClick={() => onSelectEvent(event)}
+                        className={`absolute left-0.5 right-0.5 rounded-md px-1.5 py-0.5 text-left overflow-hidden transition-colors ${colorFor(i)}`}
+                        style={{ top, height }}
+                      >
+                        <div className="text-[11px] font-semibold truncate leading-tight">{event.title}</div>
+                        <div className="text-[10px] opacity-75 truncate">{format(start, 'h:mm a')}</div>
+                      </button>
+                    );
+                  })}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
