@@ -124,16 +124,33 @@ export async function PATCH(req: NextRequest) {
     if (items.length === 0) return NextResponse.json({ error: 'No events provided' }, { status: 400 });
 
     const results = await Promise.allSettled(
-      items.map(async ({ eventId, updates }) => {
-        const patchBody = buildPatchBody(updates ?? {});
-        const res = await fetch(`${BASE}/${eventId}`, {
-          method: 'PATCH',
-          headers: { Authorization: `Bearer ${session.accessToken}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify(patchBody),
-        });
-        if (!res.ok) {
-          const errData = await res.json();
-          throw new Error(errData.error?.message ?? `HTTP ${res.status}`);
+      items.map(async ({ eventId, updates = {} }) => {
+        const { calendarId, ...fieldUpdates } = updates as Record<string, unknown>;
+
+        // Patch non-calendar fields if any
+        const patchBody = buildPatchBody(fieldUpdates);
+        if (Object.keys(patchBody).length > 0) {
+          const res = await fetch(`${BASE}/${eventId}`, {
+            method: 'PATCH',
+            headers: { Authorization: `Bearer ${session.accessToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify(patchBody),
+          });
+          if (!res.ok) {
+            const errData = await res.json();
+            throw new Error(errData.error?.message ?? `HTTP ${res.status}`);
+          }
+        }
+
+        // Move to a different calendar if requested
+        if (calendarId) {
+          const moveRes = await fetch(
+            `https://www.googleapis.com/calendar/v3/calendars/primary/events/${eventId}/move?destination=${encodeURIComponent(String(calendarId))}`,
+            { method: 'POST', headers: { Authorization: `Bearer ${session.accessToken}` } }
+          );
+          if (!moveRes.ok) {
+            const errData = await moveRes.json();
+            throw new Error(errData.error?.message ?? `HTTP ${moveRes.status}`);
+          }
         }
       })
     );
